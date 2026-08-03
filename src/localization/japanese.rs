@@ -16,6 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     settings: "設定",
     start_with_windows: "Windows と同時に開始",
     reset_position: "位置をリセット",
+    screen: "画面",
     language: "言語",
     system_default: "システム既定",
     check_for_updates: "更新を確認",

@@ -1,8 +1,83 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// A taskbar window (primary or secondary) together with the monitor it sits on.
+#[derive(Clone)]
+pub struct TaskbarInfo {
+    pub hwnd: HWND,
+    /// Monitor device name (e.g. `\\.\DISPLAY2`), stable enough to persist.
+    pub device: String,
+    pub monitor_rect: RECT,
+    pub is_primary: bool,
+}
+
+/// Enumerate all taskbars that can host the widget: the primary `Shell_TrayWnd`
+/// plus every secondary `Shell_SecondaryTrayWnd` (present when Windows shows the
+/// taskbar on all displays). The primary is always listed first.
+pub fn enumerate_taskbars() -> Vec<TaskbarInfo> {
+    let mut taskbars = Vec::new();
+
+    if let Some(primary) = find_taskbar() {
+        if let Some(info) = taskbar_info(primary) {
+            taskbars.push(info);
+        }
+    }
+
+    unsafe {
+        let class = wide_str("Shell_SecondaryTrayWnd");
+        let mut prev = HWND::default();
+        loop {
+            match FindWindowExW(
+                HWND::default(),
+                prev,
+                PCWSTR::from_raw(class.as_ptr()),
+                PCWSTR::null(),
+            ) {
+                Ok(h) if h != HWND::default() => {
+                    if let Some(info) = taskbar_info(h) {
+                        taskbars.push(info);
+                    }
+                    prev = h;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    taskbars
+}
+
+fn taskbar_info(hwnd: HWND) -> Option<TaskbarInfo> {
+    unsafe {
+        // MONITOR_DEFAULTTONEAREST always returns a valid monitor handle.
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        let ok = GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO);
+        if !ok.as_bool() {
+            return None;
+        }
+        // MONITORINFOF_PRIMARY == 0x1
+        let is_primary = (info.monitorInfo.dwFlags & 0x1) != 0;
+        Some(TaskbarInfo {
+            hwnd,
+            device: string_from_wide(&info.szDevice),
+            monitor_rect: info.monitorInfo.rcMonitor,
+            is_primary,
+        })
+    }
+}
+
+fn string_from_wide(buffer: &[u16]) -> String {
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
+}
 
 // Window style constants
 pub const WS_POPUP_STYLE: u32 = 0x80000000;

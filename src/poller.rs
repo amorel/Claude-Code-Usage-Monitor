@@ -36,12 +36,35 @@ pub type CredentialWatchSnapshot = Vec<String>;
 struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
+    /// Richer per-limit breakdown, including model-scoped weekly limits (Fable).
+    limits: Option<Vec<UsageLimitEntry>>,
 }
 
 #[derive(Deserialize)]
 struct UsageBucket {
     utilization: f64,
     resets_at: Option<String>,
+}
+
+/// One entry of the `limits[]` array returned by the usage endpoint. We only
+/// care about the model-scoped weekly limits (e.g. `scope.model.display_name`
+/// == "Fable"); the rest duplicate `five_hour` / `seven_day`.
+#[derive(Deserialize)]
+struct UsageLimitEntry {
+    #[serde(default)]
+    percent: f64,
+    resets_at: Option<String>,
+    scope: Option<UsageLimitScope>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitScope {
+    model: Option<UsageLimitModel>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitModel {
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -555,7 +578,27 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
     }
 
+    data.fable = extract_model_weekly(response.limits.as_deref(), "Fable");
+
     Ok(Some(data))
+}
+
+/// Find the model-scoped weekly limit for the given display name in the
+/// `limits[]` array (e.g. "Fable"), if present.
+fn extract_model_weekly(limits: Option<&[UsageLimitEntry]>, model: &str) -> Option<UsageSection> {
+    let entry = limits?.iter().find(|entry| {
+        entry
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.model.as_ref())
+            .and_then(|model| model.display_name.as_deref())
+            == Some(model)
+    })?;
+
+    Some(UsageSection {
+        percentage: entry.percent,
+        resets_at: parse_iso8601(entry.resets_at.as_deref()),
+    })
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {

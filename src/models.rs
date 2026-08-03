@@ -10,6 +10,9 @@ pub struct UsageSection {
 pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
+    /// Weekly usage scoped to a specific model (currently Fable). `None` when the
+    /// API reports no such scoped limit (e.g. Codex, or the Messages fallback).
+    pub fable: Option<UsageSection>,
 }
 
 #[derive(Clone, Debug, Default)]

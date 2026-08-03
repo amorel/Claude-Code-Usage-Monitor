@@ -47,6 +47,11 @@ impl SendHwnd {
 struct AppState {
     hwnd: SendHwnd,
     taskbar_hwnd: Option<HWND>,
+    /// Primary taskbar handle, watched to detect explorer.exe restarts even when
+    /// the widget is embedded in a secondary-monitor taskbar.
+    watch_taskbar_hwnd: Option<HWND>,
+    /// Monitor device name the user pinned the widget to (`None` = auto/primary).
+    screen_device: Option<String>,
     tray_notify_hwnd: Option<HWND>,
     win_event_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
@@ -59,6 +64,9 @@ struct AppState {
     session_text: String,
     weekly_percent: f64,
     weekly_text: String,
+    fable_percent: f64,
+    fable_text: String,
+    fable_visible: bool,
     codex_session_percent: f64,
     codex_session_text: String,
     codex_weekly_percent: f64,
@@ -123,6 +131,10 @@ const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
+const IDM_SCREEN_AUTO: u16 = 70;
+const IDM_SCREEN_BASE: u16 = 71;
+/// Upper bound (exclusive) for per-taskbar screen menu item IDs (71..=86).
+const IDM_SCREEN_END: u16 = 87;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -206,6 +218,22 @@ fn relaunch_self() -> ! {
     std::process::exit(0);
 }
 
+/// Persist the chosen screen and relaunch so the widget re-embeds on it. The
+/// relaunch reuses the same fully-tested startup path the watchdog relies on,
+/// which re-runs embedding against the newly pinned monitor.
+fn apply_screen_selection(device: Option<String>) {
+    {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) if s.screen_device != device => s.screen_device = device,
+            // No change, or no state yet: nothing to do.
+            _ => return,
+        }
+    }
+    save_state_settings();
+    relaunch_self();
+}
+
 /// Detect explorer.exe restarts and recover from them.
 ///
 /// Once explorer destroys the taskbar, our embedded child window is destroyed
@@ -217,7 +245,7 @@ fn spawn_taskbar_watchdog() {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
         let stored = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            state.as_ref().and_then(|s| s.watch_taskbar_hwnd)
         };
         // Only relevant once we have embedded into a taskbar at least once.
         let Some(old) = stored else {
@@ -293,6 +321,8 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen_device: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -305,6 +335,7 @@ impl Default for SettingsFile {
             widget_visible: true,
             show_claude_code: true,
             show_codex: false,
+            screen_device: None,
         }
     }
 }
@@ -360,6 +391,7 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
+            screen_device: s.screen_device.clone(),
         });
     }
 }
@@ -370,15 +402,19 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
             if s.show_claude_code {
+                let model = s.language.strings().claude_code_model;
+                let tooltip = if s.fable_visible {
+                    format!(
+                        "{} 5h: {} | 7d: {} | Fable: {}",
+                        model, s.session_text, s.weekly_text, s.fable_text
+                    )
+                } else {
+                    format!("{} 5h: {} | 7d: {}", model, s.session_text, s.weekly_text)
+                };
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
                     percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
+                    tooltip,
                 });
             }
             if s.show_codex {
@@ -500,9 +536,16 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(claude_code) = data.claude_code.as_ref() {
         state.session_text = poller::format_line(&claude_code.session, strings);
         state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        match claude_code.fable.as_ref() {
+            Some(fable) if state.show_claude_code => {
+                state.fable_text = poller::format_line(fable, strings);
+            }
+            _ => state.fable_text = "--".to_string(),
+        }
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
+        state.fable_text = "--".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
@@ -898,7 +941,13 @@ const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
 const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 1;
+/// Widget height in DPI-independent px. Stays FIXED whether or not the Fable
+/// row is shown: the taskbar clips embedded child windows to its own height
+/// (~48px), so a taller widget would have its extra row cropped off-screen.
+/// A visible Fable row is packed in by tightening the inter-row spacing instead.
 const WIDGET_HEIGHT: i32 = 46;
+/// Label used for the Fable weekly row (model name, not localized).
+const FABLE_LABEL: &str = "F";
 
 fn active_model_count(show_claude_code: bool, show_codex: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32).max(1)
@@ -1084,6 +1133,8 @@ pub fn run() {
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
                 taskbar_hwnd: None,
+                watch_taskbar_hwnd: None,
+                screen_device: settings.screen_device.clone(),
                 tray_notify_hwnd: None,
                 win_event_hook: None,
                 is_dark,
@@ -1095,6 +1146,9 @@ pub fn run() {
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
+                fable_percent: 0.0,
+                fable_text: "--".to_string(),
+                fable_visible: false,
                 codex_session_percent: 0.0,
                 codex_session_text: "--".to_string(),
                 codex_weekly_percent: 0.0,
@@ -1119,15 +1173,26 @@ pub fn run() {
             });
         }
 
-        // Try to embed in taskbar
-        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
-            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
+        // Try to embed in the chosen taskbar: the primary by default, or the one
+        // on the monitor the user pinned via the Screen menu.
+        let taskbars = native_interop::enumerate_taskbars();
+        let target = pick_target_taskbar(&taskbars, settings.screen_device.as_deref());
+        if let Some(target) = target {
+            let taskbar_hwnd = target.hwnd;
+            diagnose::log(format!(
+                "embedding in taskbar hwnd={:?} device={} primary={}",
+                taskbar_hwnd, target.device, target.is_primary
+            ));
             native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
             embedded = true;
 
             let mut state = lock_state();
             let s = state.as_mut().unwrap();
             s.taskbar_hwnd = Some(taskbar_hwnd);
+            // Watch the PRIMARY taskbar for explorer restarts regardless of which
+            // monitor we embedded into, so a secondary embed can't spin the
+            // watchdog into a relaunch loop.
+            s.watch_taskbar_hwnd = native_interop::find_taskbar();
             s.embedded = true;
 
             let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
@@ -1241,6 +1306,9 @@ fn render_layered() {
         session_text,
         weekly_pct,
         weekly_text,
+        fable_pct,
+        fable_text,
+        fable_visible,
         codex_session_pct,
         codex_session_text,
         codex_weekly_pct,
@@ -1259,6 +1327,9 @@ fn render_layered() {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.fable_percent,
+                s.fable_text.clone(),
+                s.fable_visible,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
@@ -1348,6 +1419,9 @@ fn render_layered() {
             &session_text,
             weekly_pct,
             &weekly_text,
+            fable_pct,
+            &fable_text,
+            fable_visible,
             codex_session_pct,
             &codex_session_text,
             codex_weekly_pct,
@@ -1418,6 +1492,9 @@ fn paint_content(
     session_text: &str,
     weekly_pct: f64,
     weekly_text: &str,
+    fable_pct: f64,
+    fable_text: &str,
+    fable_visible: bool,
     codex_session_pct: f64,
     codex_session_text: &str,
     codex_weekly_pct: f64,
@@ -1476,8 +1553,23 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let seg_h = sc(SEGMENT_H);
+        // Bottom-anchored rows, order top->bottom: session, weekly, Fable.
+        // With Fable shown, three bars are packed into the same fixed widget
+        // height by tightening the padding and inter-row gap; the taskbar clips
+        // anything taller than itself, so the widget must not grow.
+        let (row1_y, row2_y, fable_y) = if fable_visible {
+            let gap = sc(2);
+            let pad = sc(2);
+            let fable_y = height - pad - seg_h;
+            let weekly_y = fable_y - gap - seg_h;
+            let session_y = weekly_y - gap - seg_h;
+            (session_y, weekly_y, fable_y)
+        } else {
+            let row2_y = height - sc(5) - seg_h;
+            let row1_y = row2_y - sc(10) - seg_h;
+            (row1_y, row2_y, row2_y)
+        };
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1535,6 +1627,22 @@ fn paint_content(
             codex_accent,
             track,
         );
+        if fable_visible {
+            draw_fable_row(
+                hdc,
+                content_x,
+                fable_y,
+                is_dark,
+                text_color,
+                FABLE_LABEL,
+                fable_pct,
+                fable_text,
+                show_claude_code,
+                show_codex,
+                accent,
+                track,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -1558,9 +1666,21 @@ fn do_poll(send_hwnd: SendHwnd) {
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
+                    match claude_code.fable.as_ref() {
+                        Some(fable) if s.show_claude_code => {
+                            s.fable_percent = fable.percentage;
+                            s.fable_visible = true;
+                        }
+                        _ => {
+                            s.fable_percent = 0.0;
+                            s.fable_visible = false;
+                        }
+                    }
                 } else if s.show_claude_code {
                     s.session_percent = 0.0;
                     s.weekly_percent = 0.0;
+                    s.fable_percent = 0.0;
+                    s.fable_visible = false;
                 }
                 if let Some(codex) = data.codex.as_ref() {
                     s.codex_session_percent = codex.session.percentage;
@@ -1814,6 +1934,35 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
+/// Choose which taskbar to embed into: the one on the pinned monitor device if
+/// present, otherwise the primary, otherwise the first available.
+fn pick_target_taskbar(
+    taskbars: &[native_interop::TaskbarInfo],
+    device: Option<&str>,
+) -> Option<native_interop::TaskbarInfo> {
+    if let Some(device) = device {
+        if let Some(found) = taskbars.iter().find(|t| t.device == device) {
+            return Some(found.clone());
+        }
+    }
+    taskbars
+        .iter()
+        .find(|t| t.is_primary)
+        .or_else(|| taskbars.first())
+        .cloned()
+}
+
+/// Taskbar bounds used for positioning. The primary taskbar is queried through
+/// the shell app-bar API; secondary taskbars — for which that API returns the
+/// primary's rect — fall back to their own window rect.
+fn taskbar_rect_of(taskbar_hwnd: HWND) -> Option<RECT> {
+    if Some(taskbar_hwnd) == native_interop::find_taskbar() {
+        native_interop::get_taskbar_rect(taskbar_hwnd)
+    } else {
+        native_interop::get_window_rect_safe(taskbar_hwnd)
+    }
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
@@ -1841,7 +1990,7 @@ fn position_at_taskbar() {
         (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
     };
 
-    let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
+    let taskbar_rect = match taskbar_rect_of(taskbar_hwnd) {
         Some(r) => r,
         None => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
@@ -2129,7 +2278,7 @@ unsafe extern "system" fn wnd_proc(
 
                     // Clamp: don't go past left edge of taskbar
                     if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
+                        if let Some(taskbar_rect) = taskbar_rect_of(taskbar_hwnd) {
                             let mut tray_left = taskbar_rect.right;
                             if let Some(tray_hwnd) =
                                 native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
@@ -2345,6 +2494,16 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_SCREEN_AUTO => {
+                    apply_screen_selection(None);
+                }
+                id if (IDM_SCREEN_BASE..IDM_SCREEN_END).contains(&id) => {
+                    let index = (id - IDM_SCREEN_BASE) as usize;
+                    let taskbars = native_interop::enumerate_taskbars();
+                    if let Some(taskbar) = taskbars.get(index) {
+                        apply_screen_selection(Some(taskbar.device.clone()));
+                    }
+                }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
                 | IDM_LANG_DUTCH
@@ -2426,6 +2585,7 @@ fn show_context_menu(hwnd: HWND) {
             widget_visible,
             show_claude_code,
             show_codex,
+            screen_device,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2439,6 +2599,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                     s.show_claude_code,
                     s.show_codex,
+                    s.screen_device.clone(),
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2450,6 +2611,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     true,
                     false,
+                    None,
                 ),
             }
         };
@@ -2553,6 +2715,61 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        // Screen submenu: which monitor's taskbar hosts the widget.
+        let screen_menu = CreatePopupMenu().unwrap();
+        let auto_label = native_interop::wide_str(strings.system_default);
+        let auto_flags = if screen_device.is_none() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            screen_menu,
+            auto_flags,
+            IDM_SCREEN_AUTO as usize,
+            PCWSTR::from_raw(auto_label.as_ptr()),
+        );
+
+        let screen_taskbars = native_interop::enumerate_taskbars();
+        for (index, taskbar) in screen_taskbars.iter().enumerate() {
+            if (IDM_SCREEN_BASE as usize + index) >= IDM_SCREEN_END as usize {
+                break;
+            }
+            let w = taskbar.monitor_rect.right - taskbar.monitor_rect.left;
+            let h = taskbar.monitor_rect.bottom - taskbar.monitor_rect.top;
+            // Number the entry by its Windows display index (parsed from the
+            // `\\.\DISPLAYn` device name) so it matches Display Settings; fall
+            // back to the enumeration order if the name has no trailing digits.
+            let display_no = taskbar
+                .device
+                .trim_start_matches(|c: char| !c.is_ascii_digit());
+            let label = if display_no.is_empty() {
+                format!("{} {} ({}\u{00d7}{})", strings.screen, index + 1, w, h)
+            } else {
+                format!("{} {} ({}\u{00d7}{})", strings.screen, display_no, w, h)
+            };
+            let label_wide = native_interop::wide_str(&label);
+            let flags = if screen_device.as_deref() == Some(taskbar.device.as_str()) {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                screen_menu,
+                flags,
+                (IDM_SCREEN_BASE + index as u16) as usize,
+                PCWSTR::from_raw(label_wide.as_ptr()),
+            );
+        }
+
+        let screen_label = native_interop::wide_str(strings.screen);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            screen_menu.0 as usize,
+            PCWSTR::from_raw(screen_label.as_ptr()),
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -2672,6 +2889,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
         session_text,
         weekly_pct,
         weekly_text,
+        fable_pct,
+        fable_text,
+        fable_visible,
         codex_session_pct,
         codex_session_text,
         codex_weekly_pct,
@@ -2688,6 +2908,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.session_text.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.fable_percent,
+                s.fable_text.clone(),
+                s.fable_visible,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
@@ -2745,6 +2968,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &session_text,
             weekly_pct,
             &weekly_text,
+            fable_pct,
+            &fable_text,
+            fable_visible,
             codex_session_pct,
             &codex_session_text,
             codex_weekly_pct,
@@ -2845,6 +3071,63 @@ fn model_usage_width(segment_count: i32) -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH)
+}
+
+/// Draw the Fable weekly row: a label plus a single Claude-accent gauge aligned
+/// under the Claude bar of the rows above. Fable only exists as a Claude
+/// weekly-scoped limit, so there is no Codex bar on this row.
+fn draw_fable_row(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    is_dark: bool,
+    text_color: &Color,
+    label: &str,
+    percent: f64,
+    text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    accent: &Color,
+    track: &Color,
+) {
+    let seg_h = sc(SEGMENT_H);
+    let active_models = active_model_count(show_claude_code, show_codex);
+    let segment_count = row_bar_segment_count(active_models);
+    let value_color = if show_claude_code && show_codex {
+        claude_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
+
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: y,
+            right: x + sc(LABEL_WIDTH),
+            bottom: y + seg_h,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let bar_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        draw_usage_bar(
+            hdc,
+            bar_x,
+            y,
+            segment_count,
+            percent,
+            text,
+            accent,
+            track,
+            &value_color,
+        );
+    }
 }
 
 fn draw_usage_bar(
