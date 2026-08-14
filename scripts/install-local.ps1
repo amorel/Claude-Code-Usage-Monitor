@@ -84,6 +84,16 @@ if ($Uninstall) {
     return
 }
 
+# Arrêt AVANT la compilation, pas seulement avant la copie.
+#
+# Tant que le démarrage automatique pointe vers `target\release\` — c'est-à-dire
+# la situation même que ce script corrige — le widget qui tourne VERROUILLE
+# l'exécutable que cargo veut réécrire, et le build échoue sur
+# `failed to remove file ... Access is denied. (os error 5)`.
+# Le script échouait donc systématiquement à son PREMIER usage sur une machine.
+# Constaté le 2026-08-14 sur le portable.
+Stop-Widget
+
 if (-not $SkipBuild) {
     Write-Host 'Compilation (release)...'
     Push-Location $ProjectRoot
@@ -101,7 +111,7 @@ if (-not (Test-Path $BuiltExe)) {
 }
 
 Write-Host 'Installation...'
-Stop-Widget
+# (le widget a déjà été arrêté plus haut, avant la compilation)
 
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
