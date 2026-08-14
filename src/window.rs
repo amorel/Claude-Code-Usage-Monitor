@@ -177,6 +177,9 @@ fn refresh_dpi() {
 /// crash-looping); when detected we back off instead of spawning in a tight loop.
 const RELAUNCH_THROTTLE_SECS: u64 = 10;
 const RELAUNCH_BACKOFF_SECS: u64 = 30;
+/// Pause before retrying a relaunch that failed to spawn, so a persistent
+/// failure retries steadily instead of spinning at the watchdog interval.
+const RELAUNCH_RETRY_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
@@ -193,7 +196,12 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
 /// taskbar — and exiting this one is the robust recovery. The child is flagged
 /// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
 /// be released before taking over (see the guard in `run`).
-fn relaunch_self() -> ! {
+///
+/// On success this process exits and the call never returns. It returns `false`
+/// when the fresh instance could NOT be started — in that case the caller must
+/// keep this instance alive and retry, otherwise a failed respawn would take the
+/// widget down for good with nothing left running to bring it back.
+fn relaunch_self() -> bool {
     // Back off if we are relaunching very soon after the relaunch that spawned
     // us: that signals the shell is crash-looping, not a one-off restart.
     let now = now_unix_secs();
@@ -206,16 +214,33 @@ fn relaunch_self() -> ! {
         std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let _ = std::process::Command::new(exe)
-            .args(&args)
-            .env(ENV_RELAUNCH, "1")
-            .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-            .spawn();
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            diagnose::log_error("relaunch aborted: cannot resolve own executable path", error);
+            return false;
+        }
+    };
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(&exe)
+        .args(&args)
+        .env(ENV_RELAUNCH, "1")
+        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .spawn()
+    {
+        Ok(_) => {
+            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            diagnose::log_error(
+                &format!("relaunch failed: cannot spawn {}", exe.display()),
+                error,
+            );
+            false
+        }
     }
-    diagnose::log("watchdog: relaunched fresh instance, exiting old one");
-    std::process::exit(0);
 }
 
 /// Persist the chosen screen and relaunch so the widget re-embeds on it. The
@@ -231,7 +256,11 @@ fn apply_screen_selection(device: Option<String>) {
         }
     }
     save_state_settings();
-    relaunch_self();
+    if !relaunch_self() {
+        // The preference is already persisted, so the widget will land on the
+        // chosen screen at the next start; keep running here rather than dying.
+        diagnose::log("screen change: relaunch failed, staying on the current screen");
+    }
 }
 
 /// Detect explorer.exe restarts and recover from them.
@@ -257,7 +286,15 @@ fn spawn_taskbar_watchdog() {
                     "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
                     old.0, new.0
                 ));
-                relaunch_self();
+                if !relaunch_self() {
+                    // Respawn failed (shell still settling after the restart, exe
+                    // temporarily locked, ...). Stay alive and retry: exiting now
+                    // would leave nothing running to recover the widget.
+                    diagnose::log(format!(
+                        "watchdog: relaunch failed, retrying in {RELAUNCH_RETRY_SECS}s"
+                    ));
+                    std::thread::sleep(Duration::from_secs(RELAUNCH_RETRY_SECS));
+                }
             }
         }
     });
