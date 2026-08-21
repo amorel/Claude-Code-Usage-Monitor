@@ -9,7 +9,7 @@
       "placement": {
         "reference": {
           "region": "system_tray",
-          "display": 0
+          "display": 1
         },
         "nest": "taskbar",
         "horizontal": "left",

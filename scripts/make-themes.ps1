@@ -42,7 +42,11 @@
 
 [CmdletBinding()]
 param(
-    [switch]$Install
+    [switch]$Install,
+    # Écran qui accueille le widget, tel que numéroté par l'application :
+    # 0 = écran principal, 1 = suivant, etc. (les écrans sont ordonnés principal
+    # d'abord, puis de gauche à droite). Le placement fait partie du thème.
+    [int]$Display = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -150,6 +154,7 @@ function New-ThemeVariant([bool]$NoGauges, [string]$Id, [string]$Name) {
     }
 
     $surface.children = $layers.ToArray()
+    Set-Prop $surface.placement.reference 'display' $Display
     Set-Prop $theme 'id'   $Id
     Set-Prop $theme 'name' $Name
 
