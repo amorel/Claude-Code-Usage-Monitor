@@ -328,6 +328,7 @@ pub(super) fn context_menu_action_script(action: &ContextMenuAction) -> String {
             format!("set_language({})", string_arg(language))
         }
         ContextMenuAction::CheckForUpdates => "check_for_updates()".into(),
+        ContextMenuAction::SetDisplay { display } => format!("set_display({display})"),
         ContextMenuAction::ToggleLayerRender { target } => {
             format!("toggle_layer_render({})", string_arg(target))
         }

@@ -175,6 +175,11 @@ pub(super) fn context_menu_action_flags(
                     .is_some_and(|current| current.code().eq_ignore_ascii_case(language))
             }
         }
+        ContextMenuAction::SetDisplay { display } => state
+            .active_theme
+            .as_ref()
+            .and_then(|theme| theme.surfaces.first())
+            .is_some_and(|surface| surface.placement.reference.display == *display as usize),
         ContextMenuAction::ToggleLayerRender { target } => state
             .active_theme
             .as_ref()
@@ -245,6 +250,76 @@ pub(super) fn context_menu_widget_origin(theme: &ThemeDocument) -> Option<(usize
         .map(|(index, surface)| (index, surface.id.clone()))
 }
 
+/// True when the taskbar covering this display owns a notification area.
+///
+/// Only the primary taskbar has one. Anchoring a surface to `SystemTray` on a
+/// display without it resolves to the taskbar's own origin, and a right-edge
+/// alignment then pushes the surface a full width past the screen edge, where
+/// it is invisible. Callers use this to pick an anchor the display can honour.
+fn display_has_system_tray(display: usize) -> bool {
+    let Some(monitor) = native_interop::find_monitors().get(display).copied() else {
+        return false;
+    };
+    native_interop::find_taskbars().into_iter().any(|taskbar| {
+        let centre_x = (taskbar.rect.left + taskbar.rect.right) / 2;
+        let centre_y = (taskbar.rect.top + taskbar.rect.bottom) / 2;
+        centre_x >= monitor.rect.left
+            && centre_x < monitor.rect.right
+            && centre_y >= monitor.rect.top
+            && centre_y < monitor.rect.bottom
+            && native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd").is_some()
+    })
+}
+
+/// Move every surface of the active theme to `display` and persist it.
+fn apply_display_choice(hwnd: HWND, display: usize) {
+    let Some(mut theme) = lock_state()
+        .as_ref()
+        .and_then(|state| state.active_theme.clone())
+    else {
+        return;
+    };
+
+    let region = if display_has_system_tray(display) {
+        ReferenceRegion::SystemTray
+    } else {
+        // No notification area on that screen: anchor to the taskbar itself,
+        // which is also where the free space is on a secondary display.
+        ReferenceRegion::Taskbar
+    };
+
+    let mut changed = false;
+    for surface in &mut theme.surfaces {
+        let reference = &mut surface.placement.reference;
+        if reference.display != display || reference.region != region {
+            reference.display = display;
+            reference.region = region;
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+
+    match theme_engine::save_theme(&theme) {
+        Ok(path) => {
+            let mut settings = load_settings();
+            settings.active_theme_path = Some(path.to_string_lossy().into_owned());
+            save_settings_or_log(&settings, "unable to persist the chosen screen");
+            if let Err(error) = apply_custom_theme(hwnd, true, Some(path), Some(theme)) {
+                diagnose::log(format!("screen change could not be applied: {error}"));
+            }
+            position_at_taskbar();
+            render_layered();
+            diagnose::log(format!("widget moved to display {display} ({region:?})"));
+        }
+        Err(error) => {
+            // Built-in themes are read-only; the user has to duplicate first.
+            diagnose::log(format!("screen change could not be saved: {error}"));
+        }
+    }
+}
+
 pub(super) fn execute_context_menu_action(
     hwnd: HWND,
     action: ContextMenuAction,
@@ -275,6 +350,7 @@ pub(super) fn execute_context_menu_action(
         ContextMenuAction::Exit => Some(2),
         ContextMenuAction::ToggleWidget
         | ContextMenuAction::LegacyResetPosition
+        | ContextMenuAction::SetDisplay { .. }
         | ContextMenuAction::ToggleLayerRender { .. }
         | ContextMenuAction::LayerActions { .. }
         | ContextMenuAction::OpenUrl { .. } => None,
@@ -309,6 +385,9 @@ pub(super) fn execute_context_menu_action(
                 return;
             };
             let _ = execute_mouse_action_source(surface_index, &self_id, &actions);
+        }
+        ContextMenuAction::SetDisplay { display } => {
+            apply_display_choice(hwnd, display as usize);
         }
         ContextMenuAction::OpenUrl { url } if context_menu::supported_url(&url) => unsafe {
             let operation = native_interop::wide_str("open");

@@ -80,6 +80,17 @@ pub enum ContextMenuAction {
     OpenUrl {
         url: String,
     },
+    /// Move the widget to a display, straight from the context menu.
+    ///
+    /// Placement lives in the theme, so choosing a screen otherwise means
+    /// opening the dashboard and editing the surface's placement by hand. This
+    /// rewrites the active theme's placement and also picks the anchor region
+    /// that display can actually satisfy: only the primary taskbar has a
+    /// notification area, and anchoring to a missing one puts the widget off
+    /// screen.
+    SetDisplay {
+        display: u32,
+    },
     Exit,
 }
 
@@ -405,6 +416,29 @@ pub fn classic_context_menu() -> ContextMenuDocument {
             }),
     )
     .collect();
+    // Built from the displays actually attached, so the list matches reality:
+    // the document is rebuilt on every right-click.
+    let screens: Vec<ContextMenuItem> = crate::native_interop::find_monitors()
+        .iter()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let width = monitor.rect.right - monitor.rect.left;
+            let height = monitor.rect.bottom - monitor.rect.top;
+            let label = if monitor.primary {
+                format!("Screen {} ({width}\u{00d7}{height}, main)", index + 1)
+            } else {
+                format!("Screen {} ({width}\u{00d7}{height})", index + 1)
+            };
+            ContextMenuItem::action(
+                &format!("screen-{index}"),
+                &label,
+                Action::SetDisplay {
+                    display: index as u32,
+                },
+            )
+        })
+        .collect();
+
     let settings = ContextMenuItem::submenu(
         "settings",
         "Settings",
@@ -414,6 +448,7 @@ pub fn classic_context_menu() -> ContextMenuDocument {
                 "Start with Windows",
                 Action::ToggleStartup,
             ),
+            ContextMenuItem::submenu("screen", "Screen", screens),
             ContextMenuItem::submenu("language", "Language", languages),
             ContextMenuItem::separator("settings-separator"),
             ContextMenuItem::action(
@@ -663,6 +698,39 @@ fn schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classic_menu_offers_one_screen_entry_per_attached_display() {
+        let menu = classic_context_menu();
+        let settings = menu
+            .items
+            .iter()
+            .find(|item| item.id == "settings")
+            .expect("the settings submenu should exist");
+        let ContextMenuItemKind::Submenu { items } = &settings.kind else {
+            panic!("settings should be a submenu");
+        };
+        let screen = items
+            .iter()
+            .find(|item| item.id == "screen")
+            .expect("the screen submenu should exist");
+        let ContextMenuItemKind::Submenu { items } = &screen.kind else {
+            panic!("screen should be a submenu");
+        };
+
+        // One entry per display, numbered from zero in the action and from one
+        // in the label, so the menu matches what the machine actually has.
+        assert_eq!(items.len(), crate::native_interop::find_monitors().len());
+        for (index, item) in items.iter().enumerate() {
+            assert!(matches!(
+                &item.kind,
+                ContextMenuItemKind::Action {
+                    action: ContextMenuAction::SetDisplay { display }
+                } if *display == index as u32
+            ));
+        }
+        assert!(menu.validate().is_empty());
+    }
 
     #[test]
     fn classic_menu_is_valid_and_contains_the_v1_controls() {
