@@ -271,6 +271,22 @@ fn display_has_system_tray(display: usize) -> bool {
     })
 }
 
+/// Anchor to use on a display, given whether its taskbar has a notification area.
+///
+/// A surface is positioned at `anchor point - surface factor * width`, so the
+/// reference region and the surface's own alignment only make sense chosen
+/// together. Beside a notification area, the widget's right edge goes against
+/// the tray's left edge. Without one, that same pairing would measure from the
+/// taskbar's left edge and land a full width off screen, so the widget's left
+/// edge goes against the taskbar's left edge instead.
+pub(super) fn placement_for_display(has_system_tray: bool) -> (ReferenceRegion, HorizontalAnchor) {
+    if has_system_tray {
+        (ReferenceRegion::SystemTray, HorizontalAnchor::Right)
+    } else {
+        (ReferenceRegion::Taskbar, HorizontalAnchor::Left)
+    }
+}
+
 /// Move every surface of the active theme to `display` and persist it.
 fn apply_display_choice(hwnd: HWND, display: usize) {
     let Some(mut theme) = lock_state()
@@ -280,20 +296,22 @@ fn apply_display_choice(hwnd: HWND, display: usize) {
         return;
     };
 
-    let region = if display_has_system_tray(display) {
-        ReferenceRegion::SystemTray
-    } else {
-        // No notification area on that screen: anchor to the taskbar itself,
-        // which is also where the free space is on a secondary display.
-        ReferenceRegion::Taskbar
-    };
+    let (region, surface_horizontal) = placement_for_display(display_has_system_tray(display));
 
     let mut changed = false;
     for surface in &mut theme.surfaces {
-        let reference = &mut surface.placement.reference;
-        if reference.display != display || reference.region != region {
-            reference.display = display;
-            reference.region = region;
+        let placement = &mut surface.placement;
+        if placement.reference.display != display
+            || placement.reference.region != region
+            || placement.horizontal != HorizontalAnchor::Left
+            || placement.surface_horizontal != Some(surface_horizontal)
+        {
+            placement.reference.display = display;
+            placement.reference.region = region;
+            placement.horizontal = HorizontalAnchor::Left;
+            placement.surface_horizontal = Some(surface_horizontal);
+            // A drag-adjusted offset belongs to the old anchor, not this one.
+            placement.offset_x = 0;
             changed = true;
         }
     }

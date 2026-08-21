@@ -110,3 +110,41 @@ fn fullscreen_bounds_cover_the_monitor_but_maximized_work_area_does_not() {
         monitor,
     ));
 }
+
+#[test]
+fn a_display_without_a_notification_area_keeps_the_widget_on_screen() {
+    // A secondary monitor spanning -1920..0, with a taskbar across it.
+    const TASKBAR_LEFT: i32 = -1920;
+    const TASKBAR_WIDTH: i32 = 1920;
+    const WIDGET: i32 = 118;
+
+    // Beside a notification area the widget's right edge meets the anchor.
+    // Measured from a taskbar's left edge instead — which is all a display
+    // without a tray can offer — that same pairing lands a full width past the
+    // screen edge, which is how the widget went missing.
+    let (_, beside_tray) = placement_for_display(true);
+    let off_screen = aligned_origin(
+        TASKBAR_LEFT,
+        TASKBAR_WIDTH,
+        WIDGET,
+        0.0,
+        horizontal_anchor_factor(beside_tray),
+        0,
+    );
+    assert_eq!(off_screen, TASKBAR_LEFT - WIDGET);
+
+    // The anchor picked for such a display keeps it within the monitor.
+    let (region, anchor) = placement_for_display(false);
+    assert_eq!(region, ReferenceRegion::Taskbar);
+    let on_screen = aligned_origin(
+        TASKBAR_LEFT,
+        TASKBAR_WIDTH,
+        WIDGET,
+        0.0,
+        horizontal_anchor_factor(anchor),
+        0,
+    );
+    assert_eq!(on_screen, TASKBAR_LEFT);
+    assert!(on_screen >= TASKBAR_LEFT);
+    assert!(on_screen + WIDGET <= TASKBAR_LEFT + TASKBAR_WIDTH);
+}
