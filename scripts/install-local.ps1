@@ -44,7 +44,15 @@
 param(
     [switch]$SkipBuild,
     [switch]$NoDiagnose,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # Thème à activer après installation :
+    #   classic-fable         = avec les jauges (écran large)
+    #   classic-fable-compact = sans les jauges, environ moitié moins large
+    # Omis : on garde le thème déjà actif.
+    [ValidateSet('classic-fable', 'classic-fable-compact')]
+    [string]$Theme,
+    # Écran qui accueille le widget : 0 = principal, 1 = suivant.
+    [int]$Display = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,13 +113,35 @@ Stop-Widget
 
 # Thèmes personnels (rangée Fable, variante sans jauges). Régénérés depuis le
 # thème officiel embarqué, pour suivre ses évolutions.
-& (Join-Path $PSScriptRoot 'make-themes.ps1') -Install
+& (Join-Path $PSScriptRoot 'make-themes.ps1') -Install -Display $Display
 
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 Copy-Item -Path $BuiltExe -Destination $InstallPath -Force
 Write-Host "  installe : $InstallPath"
+
+# Thème actif. Écrit avant le lancement : au démarrage l'application migre les
+# anciens réglages en créant son propre thème, et prendrait la main sinon.
+if ($Theme) {
+    $settingsPath = Join-Path $env:APPDATA 'ClaudeCodeUsageMonitor\settings.json'
+    $themePath = Join-Path $env:APPDATA "ClaudeCodeUsageMonitor\themes\$Theme.json"
+    if (-not (Test-Path $themePath)) { throw "Theme introuvable : $themePath" }
+
+    $settings = if (Test-Path $settingsPath) {
+        Get-Content -Raw $settingsPath | ConvertFrom-Json
+    } else {
+        [pscustomobject]@{}
+    }
+    $settings | Add-Member -NotePropertyName active_theme_path -NotePropertyValue $themePath -Force
+    $settings | Add-Member -NotePropertyName custom_theme_enabled -NotePropertyValue $true -Force
+
+    $parent = Split-Path -Parent $settingsPath
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    # UTF-8 sans BOM : un BOM casserait la lecture JSON.
+    [System.IO.File]::WriteAllText($settingsPath, ($settings | ConvertTo-Json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "  theme actif : $Theme"
+}
 
 # Démarrage automatique -> la copie stable, jamais le dossier de build.
 $command = if ($NoDiagnose) { "`"$InstallPath`"" } else { "`"$InstallPath`" --diagnose" }

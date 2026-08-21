@@ -8,13 +8,13 @@
       "name": "Classic taskbar widget",
       "placement": {
         "reference": {
-          "region": "system_tray",
-          "display": 0
+          "region": "taskbar",
+          "display": 1
         },
         "nest": "taskbar",
         "horizontal": "left",
         "vertical": "bottom",
-        "surface_horizontal": "right",
+        "surface_horizontal": "left",
         "surface_vertical": "bottom",
         "offset_x": 0,
         "offset_y": 0

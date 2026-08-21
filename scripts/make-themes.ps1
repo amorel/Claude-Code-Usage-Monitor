@@ -169,7 +169,24 @@ function New-ThemeVariant([bool]$NoGauges, [string]$Id, [string]$Name) {
     $surface.width = "$($surface.width) + $LabelShift"
 
     $surface.children = $layers.ToArray()
+
+    # Écran et ancrage vont ensemble. La position vaut « point d'ancrage moins
+    # (facteur x largeur) » : sur l'écran principal on aligne le bord DROIT du
+    # widget sur le bord gauche de la zone de notification, donc juste à sa
+    # gauche. Les autres écrans n'ont pas de zone de notification ; le même
+    # réglage mesurerait alors depuis le bord gauche de la barre des tâches et
+    # placerait le widget une largeur entière hors écran. On y aligne donc le
+    # bord GAUCHE sur le bord gauche de la barre, là où l'espace est libre.
     Set-Prop $surface.placement.reference 'display' $Display
+    if ($Display -eq 0) {
+        Set-Prop $surface.placement.reference 'region' 'system_tray'
+        Set-Prop $surface.placement 'surface_horizontal' 'right'
+    } else {
+        Set-Prop $surface.placement.reference 'region' 'taskbar'
+        Set-Prop $surface.placement 'surface_horizontal' 'left'
+    }
+    Set-Prop $surface.placement 'horizontal' 'left'
+    Set-Prop $surface.placement 'offset_x' 0
     Set-Prop $theme 'id'   $Id
     Set-Prop $theme 'name' $Name
 
