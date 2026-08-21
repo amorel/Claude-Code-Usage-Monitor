@@ -309,6 +309,8 @@ fn usage_lines_handle_loading_errors_missing_resets_and_language() {
             weekly_label: None,
             monthly: None,
             credits: None,
+            scoped: None,
+            scoped_label: None,
             stale: false,
         },
     )]);
@@ -483,6 +485,8 @@ fn reset_stats_and_duration_formats_are_available_to_every_provider() {
             weekly_label: None,
             monthly: None,
             credits: None,
+            scoped: None,
+            scoped_label: None,
             stale: false,
         },
     )]);

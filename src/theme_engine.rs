@@ -1383,6 +1383,28 @@ impl DataContext {
             &format!("{name}.monthly.available"),
             monthly.is_some() as u8 as f64,
         );
+        // Weekly allowance for a single model (e.g. Fable). Themes gate the row
+        // on `.available`, so it only takes space once the provider reports one.
+        let scoped = usage.and_then(|usage| usage.scoped.as_ref());
+        let scoped_label = usage
+            .and_then(|usage| usage.scoped_label.as_deref())
+            .unwrap_or("")
+            .to_string();
+        self.insert_string(&format!("{name}.scoped.label"), scoped_label);
+        if let Some(scoped) = scoped {
+            self.insert(&format!("{name}.scoped.percentage"), scoped.percentage);
+            self.insert(
+                &format!("{name}.scoped.remaining"),
+                100.0 - scoped.percentage,
+            );
+        } else {
+            self.insert(&format!("{name}.scoped.percentage"), 0.0);
+            self.insert(&format!("{name}.scoped.remaining"), 100.0);
+        }
+        self.insert(
+            &format!("{name}.scoped.available"),
+            scoped.is_some() as u8 as f64,
+        );
         self.insert(&format!("{name}.available"), usage.is_some() as u8 as f64);
         // Carried over from an earlier poll: real figures, not current ones.
         self.insert(
@@ -1444,11 +1466,14 @@ impl DataContext {
         };
         let (monthly_unix, monthly_seconds) =
             reset_value(monthly.and_then(|value| value.resets_at));
+        let (scoped_unix, scoped_seconds) =
+            reset_value(scoped.and_then(|value| value.resets_at));
         for (window, unix, seconds) in [
             ("session", session_unix, session_seconds),
             ("five_hour", five_hour_unix, five_hour_seconds),
             ("weekly", weekly_unix, weekly_seconds),
             ("monthly", monthly_unix, monthly_seconds),
+            ("scoped", scoped_unix, scoped_seconds),
         ] {
             self.insert(&format!("{name}.{window}.reset.unix"), unix);
             self.insert(&format!("{name}.{window}.reset.seconds"), seconds);

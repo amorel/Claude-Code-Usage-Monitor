@@ -270,6 +270,8 @@ fn studio_preview_uses_cached_poll_failure_state_instead_of_stale_values() {
             weekly_label: None,
             monthly: None,
             credits: None,
+            scoped: None,
+            scoped_label: None,
             stale: false,
         },
     )]));

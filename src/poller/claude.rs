@@ -10,7 +10,7 @@ use super::{
     build_agent, get_header_f64, get_header_i64, parse_iso8601, unix_to_system_time, PollError,
 };
 use crate::diagnose;
-use crate::models::{CreditsSection, UsageData};
+use crate::models::{CreditsSection, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -22,6 +22,29 @@ struct UsageResponse {
     five_hour: Option<UsageBucket>,
     seven_day: Option<UsageBucket>,
     spend: Option<SpendResponse>,
+    /// Per-limit breakdown. Only the model-scoped weekly entries are read from
+    /// here; the plan-wide ones repeat `five_hour` and `seven_day`.
+    limits: Option<Vec<UsageLimit>>,
+}
+
+/// One entry of the usage endpoint's `limits` array. A `scope.model` marks a
+/// limit that applies to a single model instead of the whole plan.
+#[derive(Deserialize)]
+struct UsageLimit {
+    #[serde(default)]
+    percent: f64,
+    resets_at: Option<String>,
+    scope: Option<UsageLimitScope>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitScope {
+    model: Option<UsageLimitModel>,
+}
+
+#[derive(Deserialize)]
+struct UsageLimitModel {
+    display_name: Option<String>,
 }
 
 /// Paid credits that carry the account past its plan limits. Amounts are
@@ -158,12 +181,45 @@ pub(super) fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollE
         data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
     }
 
+    if let Some((label, section)) = model_scoped_weekly(response.limits.as_deref()) {
+        data.scoped_label = Some(label);
+        data.scoped = Some(section);
+    }
+
     data.credits = response
         .spend
         .as_ref()
         .and_then(|spend| claude_credits(spend, &data));
 
     Ok(Some(data))
+}
+
+/// Pick the model-scoped weekly limit out of the `limits` array.
+///
+/// The plan-wide entries carry no `scope.model` and are ignored: they only
+/// repeat what `five_hour` and `seven_day` already reported. When several
+/// models are scoped, the highest one is kept — that is the limit about to bite.
+fn model_scoped_weekly(limits: Option<&[UsageLimit]>) -> Option<(String, UsageSection)> {
+    limits?
+        .iter()
+        .filter_map(|limit| {
+            let name = limit
+                .scope
+                .as_ref()?
+                .model
+                .as_ref()?
+                .display_name
+                .as_deref()
+                .filter(|name| !name.is_empty())?;
+            Some((
+                name.to_string(),
+                UsageSection {
+                    percentage: limit.percent,
+                    resets_at: parse_iso8601(limit.resets_at.as_deref()),
+                },
+            ))
+        })
+        .max_by(|(_, a), (_, b)| a.percentage.total_cmp(&b.percentage))
 }
 
 /// What a failed call to the usage endpoint actually tells us.
@@ -783,6 +839,61 @@ mod tests {
             .as_ref()
             .and_then(|spend| claude_credits(spend, &data));
         data
+    }
+
+    fn scoped_from_json(json: &str) -> Option<(String, UsageSection)> {
+        let response: UsageResponse =
+            serde_json::from_str(json).expect("the fixture should deserialize");
+        model_scoped_weekly(response.limits.as_deref())
+    }
+
+    #[test]
+    fn model_scoped_weekly_reads_the_scoped_entry_and_ignores_plan_wide_ones() {
+        // Shape returned by the usage endpoint: the plan-wide entries repeat
+        // five_hour / seven_day and carry no scope, so only the scoped one counts.
+        let (label, section) = scoped_from_json(
+            r#"{
+                "five_hour": {"utilization": 49.0},
+                "seven_day": {"utilization": 90.0},
+                "limits": [
+                    {"kind": "session", "percent": 49, "scope": null},
+                    {"kind": "weekly_all", "percent": 90, "scope": null},
+                    {"kind": "weekly_scoped", "percent": 70,
+                     "resets_at": "2026-07-22T21:00:00.119921+00:00",
+                     "scope": {"model": {"id": null, "display_name": "Fable"}}}
+                ]
+            }"#,
+        )
+        .expect("the scoped limit should be picked up");
+
+        assert_eq!(label, "Fable");
+        assert_eq!(section.percentage, 70.0);
+        assert!(section.resets_at.is_some());
+    }
+
+    #[test]
+    fn model_scoped_weekly_keeps_the_highest_when_several_models_are_scoped() {
+        let (label, section) = scoped_from_json(
+            r#"{"limits": [
+                {"percent": 12, "scope": {"model": {"display_name": "Opus"}}},
+                {"percent": 70, "scope": {"model": {"display_name": "Fable"}}}
+            ]}"#,
+        )
+        .expect("a scoped limit should be picked up");
+
+        assert_eq!(label, "Fable");
+        assert_eq!(section.percentage, 70.0);
+    }
+
+    #[test]
+    fn model_scoped_weekly_is_absent_without_a_named_scope() {
+        // No limits array at all, and an unnamed scope, both mean "no row".
+        assert!(scoped_from_json(r#"{"seven_day": {"utilization": 90.0}}"#).is_none());
+        assert!(scoped_from_json(r#"{"limits": [{"percent": 90, "scope": null}]}"#).is_none());
+        assert!(scoped_from_json(
+            r#"{"limits": [{"percent": 90, "scope": {"model": {"display_name": ""}}}]}"#
+        )
+        .is_none());
     }
 
     fn status_error(code: u16) -> ureq::Error {

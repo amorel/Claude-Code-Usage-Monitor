@@ -39,6 +39,16 @@ pub struct UsageData {
     /// Kept separate from `weekly` so themes can choose how to display it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly: Option<UsageSection>,
+    /// Weekly allowance that applies to one model rather than the whole plan
+    /// (Claude reports these as `weekly_scoped`, currently for Fable). It runs
+    /// alongside `weekly` on its own budget, so it is kept separate rather than
+    /// folded into it. `None` when the provider reports no such limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped: Option<UsageSection>,
+    /// Display name of the model `scoped` applies to, as reported by the
+    /// provider (e.g. "Fable"). Used as the row label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits: Option<CreditsSection>,
     /// True when this reading was carried over from an earlier poll because

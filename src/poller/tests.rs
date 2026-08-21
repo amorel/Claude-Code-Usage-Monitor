@@ -10,6 +10,8 @@ fn usage_with_session_percent(percentage: f64) -> UsageData {
         weekly_label: None,
         monthly: None,
         credits: None,
+        scoped: None,
+        scoped_label: None,
         stale: false,
     }
 }
