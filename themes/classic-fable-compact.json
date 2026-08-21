@@ -19,7 +19,7 @@
         "offset_x": 0,
         "offset_y": 0
       },
-      "width": "42 + providers.count * (62) + max(0, providers.count - 1) * 3 + (providers.opencode.enabled + providers.cursor.enabled) * 28",
+      "width": "42 + providers.count * (62) + max(0, providers.count - 1) * 3 + (providers.opencode.enabled + providers.cursor.enabled) * 28 + claude.scoped.available * 14",
       "height": "46",
       "mouse_events": {
         "right_click": "show_context_menu(\"classic-v1\")"
@@ -414,8 +414,8 @@
         {
           "id": "provider-row",
           "name": "Enabled providers",
-          "x": "41",
-          "width": "canvas.width - 42",
+          "x": "41 + claude.scoped.available * 14",
+          "width": "canvas.width - 42 - claude.scoped.available * 14",
           "height": "46",
           "layout": "row",
           "gap": "3"
@@ -1410,7 +1410,7 @@
           "render": "system.dark * claude.scoped.available",
           "x": "13",
           "y": "32",
-          "width": "29",
+          "width": "34",
           "height": "13",
           "content": {
             "type": "text",
@@ -1432,7 +1432,7 @@
           "render": "(1 - system.dark) * claude.scoped.available",
           "x": "13",
           "y": "32",
-          "width": "29",
+          "width": "34",
           "height": "13",
           "content": {
             "type": "text",

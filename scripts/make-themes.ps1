@@ -66,6 +66,14 @@ $SessionY = "5 - claude.scoped.available * 3"    # 5 -> 2
 $WeeklyY  = "28 - claude.scoped.available * 11"  # 28 -> 17
 $ScopedY  = "32"
 
+# Le libellé de la rangée Fable est un nom de modèle ("Fable"), bien plus large
+# que "5h" ou "7d" : il déborde sur la colonne des pourcentages, qui commence à
+# 41. On élargit donc la colonne des libellés et on décale les fournisseurs
+# d'autant — uniquement quand la rangée est là, pour ne pas élargir le widget
+# le reste du temps.
+$ScopedLabelWidth = 34                        # 13 -> 47
+$LabelShift       = "claude.scoped.available * 14"
+
 function Copy-Layer($layer) {
     # Copie profonde : les calques clonés doivent être indépendants.
     $layer | ConvertTo-Json -Depth 60 | ConvertFrom-Json
@@ -106,9 +114,7 @@ function New-ThemeVariant([bool]$NoGauges, [string]$Id, [string]$Name) {
         Set-Prop $clone 'y'      $ScopedY
 
         if ($sourceId -like '*-label-*') {
-            # Le libellé porte le nom du modèle ("Fable"), plus long que "7d" :
-            # on élargit jusqu'au bord de la colonne des fournisseurs.
-            Set-Prop $clone 'width' '29'
+            Set-Prop $clone 'width' "$ScopedLabelWidth"
             $clone.content.template = '{claude.scoped.label}'
         } elseif ($sourceId -like '*-segments-*') {
             $clone.content.value = 'claude.scoped.percentage'
@@ -129,6 +135,12 @@ function New-ThemeVariant([bool]$NoGauges, [string]$Id, [string]$Name) {
         if ("$($layer.y)" -eq '28') { $layer.y = $WeeklyY;  $moved++ }
     }
     if ($moved -eq 0) { throw "Aucune rangee repositionnee - le theme officiel a change de forme." }
+
+    # --- Décaler la colonne des fournisseurs pour dégager le libellé Fable ----
+    $row = $layers | Where-Object { $_.id -eq 'provider-row' } | Select-Object -First 1
+    if (-not $row) { throw "Calque 'provider-row' introuvable - le theme officiel a change de forme." }
+    Set-Prop $row 'x'     "$($row.x) + $LabelShift"
+    Set-Prop $row 'width' "$($row.width) - $LabelShift"
 
     # --- Variante sans jauges ------------------------------------------------
     $hidden = 0
@@ -152,6 +164,9 @@ function New-ThemeVariant([bool]$NoGauges, [string]$Id, [string]$Name) {
             $surface.width = "$($surface.width)".Replace("$GaugeExpr + 4 + $w", "$w")
         }
     }
+
+    # Le widget s'élargit du même décalage, sinon le dernier fournisseur est coupé.
+    $surface.width = "$($surface.width) + $LabelShift"
 
     $surface.children = $layers.ToArray()
     Set-Prop $surface.placement.reference 'display' $Display
