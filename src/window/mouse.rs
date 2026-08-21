@@ -329,3 +329,129 @@ pub(super) unsafe fn set_surface_cursor(hwnd: HWND) -> bool {
     }
     clickable
 }
+
+/// Minimum travel, in physical pixels, before a press counts as a drag rather
+/// than a click. Without it every click would nudge the widget.
+const DRAG_THRESHOLD_PX: i32 = 3;
+
+/// Start dragging the widget along its taskbar.
+///
+/// Upstream dropped the drag handle when placement moved into the theme, which
+/// left `offset_x` reachable only through the theme editor. This restores
+/// direct manipulation by driving that same value: the drag edits the live
+/// theme, and the result is written back when the button is released.
+pub(super) fn begin_widget_drag(hwnd: HWND) {
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    let started = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) => {
+                let Some(offset) = s
+                    .active_theme
+                    .as_ref()
+                    .and_then(|theme| theme.surfaces.first())
+                    .map(|surface| surface.placement.offset_x)
+                else {
+                    return;
+                };
+                s.dragging = true;
+                s.drag_start_mouse_x = point.x;
+                s.drag_start_offset = offset;
+                true
+            }
+            None => false,
+        }
+    };
+    if started {
+        unsafe {
+            SetCapture(hwnd);
+        }
+    }
+}
+
+/// Follow the pointer while dragging, moving the widget as it goes.
+pub(super) fn update_widget_drag() {
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    let moved = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        if !s.dragging {
+            return;
+        }
+        let travel = point.x - s.drag_start_mouse_x;
+        if travel.abs() < DRAG_THRESHOLD_PX {
+            return;
+        }
+        // Offsets are stored in logical pixels and scaled when positioning, so
+        // the pointer's travel has to be brought back to the same units.
+        let scale = s
+            .active_theme
+            .as_ref()
+            .map(|theme| theme_surface_scale(theme, 0))
+            .filter(|scale| *scale > 0.0)
+            .unwrap_or(1.0);
+        let offset = s.drag_start_offset + (travel as f64 / scale).round() as i32;
+        let Some(theme) = s.active_theme.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        for surface in &mut theme.surfaces {
+            if surface.placement.offset_x != offset {
+                surface.placement.offset_x = offset;
+                changed = true;
+            }
+        }
+        changed
+    };
+    if moved {
+        position_at_taskbar();
+        render_layered();
+    }
+}
+
+/// End a drag, releasing the pointer and saving the position.
+///
+/// Returns true only when the widget actually moved, so the caller can tell a
+/// drag from a plain click and let the click through untouched.
+pub(super) fn finish_widget_drag() -> bool {
+    let (was_dragging, moved, theme) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return false;
+        };
+        if !s.dragging {
+            return false;
+        }
+        s.dragging = false;
+        let offset = s
+            .active_theme
+            .as_ref()
+            .and_then(|theme| theme.surfaces.first())
+            .map(|surface| surface.placement.offset_x);
+        let moved = offset.is_some_and(|offset| offset != s.drag_start_offset);
+        (true, moved, s.active_theme.clone())
+    };
+    if was_dragging {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    if moved {
+        if let Some(theme) = theme {
+            // Built-in themes are read-only; the position then lasts for the
+            // session only, which beats refusing to move at all.
+            if let Err(error) = theme_engine::save_theme(&theme) {
+                diagnose::log(format!("widget position could not be saved: {error}"));
+            }
+        }
+    }
+    moved
+}

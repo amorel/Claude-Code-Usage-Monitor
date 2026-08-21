@@ -57,6 +57,24 @@ $OutputDir   = Join-Path $ProjectRoot 'themes'
 
 if (-not (Test-Path $Source)) { throw "Theme source introuvable : $Source" }
 
+# Sans -Display explicite, reprendre l'écran du thème déjà installé : une simple
+# réinstallation ne doit pas ramener le widget sur l'écran principal alors que
+# l'utilisateur l'a déplacé.
+if (-not $PSBoundParameters.ContainsKey('Display')) {
+    $installed = Join-Path $env:APPDATA 'ClaudeCodeUsageMonitor\themes\classic-fable.json'
+    if (Test-Path $installed) {
+        try {
+            $current = (Get-Content -Raw $installed | ConvertFrom-Json).surfaces[0].placement.reference.display
+            if ($null -ne $current) {
+                $Display = [int]$current
+                Write-Host "  ecran conserve : $Display"
+            }
+        } catch {
+            Write-Host "  ecran du theme installe illisible, retour a l'ecran principal"
+        }
+    }
+}
+
 # Largeur d'une jauge dans le thème officiel, telle qu'écrite dans le JSON.
 $GaugeExpr = 'ceil(10 / max(1, providers.count)) * 11 - 1'
 

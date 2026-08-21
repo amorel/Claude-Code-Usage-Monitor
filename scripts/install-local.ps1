@@ -52,7 +52,8 @@ param(
     [ValidateSet('classic-fable', 'classic-fable-compact')]
     [string]$Theme,
     # Écran qui accueille le widget : 0 = principal, 1 = suivant.
-    [int]$Display = 0
+    # Omis : on conserve l'écran du thème déjà installé.
+    [int]$Display
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,7 +114,9 @@ Stop-Widget
 
 # Thèmes personnels (rangée Fable, variante sans jauges). Régénérés depuis le
 # thème officiel embarqué, pour suivre ses évolutions.
-& (Join-Path $PSScriptRoot 'make-themes.ps1') -Install -Display $Display
+$themeArgs = @{ Install = $true }
+if ($PSBoundParameters.ContainsKey('Display')) { $themeArgs['Display'] = $Display }
+& (Join-Path $PSScriptRoot 'make-themes.ps1') @themeArgs
 
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
