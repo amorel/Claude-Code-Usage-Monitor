@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -172,6 +172,26 @@ fn language_from_menu_command_id(command: u16) -> Option<LanguageId> {
 /// How often the watchdog thread polls for an explorer.exe restart (which
 /// recreates the taskbar and wipes our tray-icon registration).
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+
+/// How long the UI thread may stay unresponsive before the watchdog treats the
+/// widget as wedged and replaces it with a fresh process. Long enough that a
+/// slow repaint or a busy shell never costs a relaunch.
+const UI_HANG_RECOVERY_SECS: u64 = 30;
+
+/// How long a single liveness probe waits for the UI thread to answer.
+const UI_PROBE_TIMEOUT_MS: u32 = 1_000;
+
+/// How long a shell-hosted surface may stay orphaned before the watchdog steps
+/// in. Explorer's `TaskbarCreated` broadcast re-embeds the widget well inside
+/// this window, so the grace period leaves the normal path in charge.
+const ORPHAN_RECOVERY_SECS: u64 = 10;
+
+/// Main window handle published for the watchdog outside of `STATE`.
+///
+/// The watchdog has to diagnose a wedged UI thread even when that thread is
+/// wedged while holding the state mutex, so its recovery path never takes a
+/// lock. Written once, right after the window is created.
+static PRIMARY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -355,7 +375,13 @@ fn relaunch_self() {
         }
     };
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Without this the replacement truncates the log on startup and takes the
+    // reason for its own relaunch with it - the one entry worth reading after
+    // the widget has recovered on its own.
+    if diagnose::is_enabled() && !args.iter().any(|arg| arg == "--diagnose-append") {
+        args.push("--diagnose-append".to_string());
+    }
     match std::process::Command::new(exe)
         .args(&args)
         .env(ENV_RELAUNCH, "1")
@@ -372,48 +398,152 @@ fn relaunch_self() {
     }
 }
 
-/// Detect explorer.exe restarts and recover from them.
+/// Ask the UI thread to acknowledge an empty message.
+///
+/// The watchdog runs on its own thread, so `SendMessageTimeoutW` here is
+/// answered by the window's owning thread: it comes back at once while the
+/// message loop is pumping, and times out once that loop is parked inside a
+/// call that never returns - a synchronous shell call caught out by an
+/// explorer.exe restart being the case seen in the wild.
+///
+/// The probe is sent every cycle rather than gated behind `IsHungAppWindow`,
+/// which measured false throughout a wedged widget: the shell's hang detection
+/// covers top-level windows, and ours spends its life embedded in the taskbar.
+fn ui_thread_responds(hwnd: HWND) -> bool {
+    unsafe {
+        // A destroyed window belongs to the surface check below, not here;
+        // calling it responsive keeps the two verdicts from overlapping.
+        if !IsWindow(hwnd).as_bool() {
+            return true;
+        }
+        let mut acknowledged = 0usize;
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            UI_PROBE_TIMEOUT_MS,
+            Some(&mut acknowledged),
+        )
+        .0 != 0
+    }
+}
+
+/// Report a window that outlived the host it was embedded into.
+///
+/// `IsWindow` still answers true for it: the window is alive, it has merely
+/// stopped being drawn anywhere. Explorer leaves ours that way when it restarts
+/// while the UI thread cannot re-embed, so the orphan has to be recognised on
+/// its own rather than through a destroyed-handle check.
+fn parent_was_destroyed(window: SendHwnd) -> bool {
+    unsafe {
+        GetParent(window.to_hwnd())
+            .ok()
+            .filter(|parent| !parent.is_invalid())
+            .is_some_and(|parent| !IsWindow(parent).as_bool())
+    }
+}
+
+/// Detect explorer.exe restarts and wedged UI threads, and recover from both.
 ///
 /// Explorer owns both taskbar and desktop surface hosts. When it restarts, any
 /// child widget windows are destroyed; if the primary window was hosted there,
-/// the UI message loop is lost as well. A dedicated thread checks all native
-/// surface handles and relaunches after the shell has returned.
+/// the UI message loop is lost as well. Two further failures leave every handle
+/// valid while the widget stops drawing and stops polling, so a plain validity
+/// check never sees them: a window orphaned by the host it was embedded into,
+/// and a UI thread parked in a call that never returns. A dedicated thread
+/// probes for all three and relaunches after the shell has returned.
 fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let (shell_hosted, windows) = {
-            let state = lock_state();
-            let Some(state) = state.as_ref() else {
+    std::thread::spawn(move || {
+        // Elapsed time rather than a cycle count: a probe that times out makes
+        // its own cycle longer than the sleep interval, so counting cycles
+        // would quietly stretch both delays past the figures named above.
+        let mut unresponsive_since: Option<Instant> = None;
+        let mut orphaned_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+
+            // Probed first, and without the state mutex: a UI thread wedged
+            // while holding that lock is precisely what this has to survive.
+            let primary = SendHwnd(PRIMARY_HWND.load(Ordering::Relaxed)).to_hwnd();
+            if primary.is_invalid() || ui_thread_responds(primary) {
+                unresponsive_since = None;
+            } else {
+                let since = *unresponsive_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(UI_HANG_RECOVERY_SECS) {
+                    diagnose::log(format!(
+                        "watchdog: UI thread stopped answering for {UI_HANG_RECOVERY_SECS}s -> relaunching"
+                    ));
+                    unresponsive_since = None;
+                    relaunch_self();
+                }
                 continue;
+            }
+
+            let (shell_hosted, windows) = {
+                let state = match STATE.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    // The UI thread answers, so the lock is held by work in
+                    // flight: read the surfaces on the next pass rather than
+                    // waiting here and stalling the probe above.
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                };
+                let Some(state) = state.as_ref() else {
+                    continue;
+                };
+                let shell_hosted = state.active_theme.as_ref().is_some_and(|theme| {
+                    theme.surfaces.iter().any(|surface| {
+                        matches!(
+                            surface
+                                .placement
+                                .nest
+                                .resolve(surface.placement.reference.region),
+                            SurfaceNest::Taskbar | SurfaceNest::Desktop
+                        )
+                    })
+                });
+                (
+                    shell_hosted,
+                    std::iter::once(state.hwnd)
+                        .chain(state.mirror_hwnds.iter().copied())
+                        .chain(state.desktop_hwnds.iter().flatten().copied())
+                        .collect::<Vec<_>>(),
+                )
             };
-            let shell_hosted = state.active_theme.as_ref().is_some_and(|theme| {
-                theme.surfaces.iter().any(|surface| {
-                    matches!(
-                        surface
-                            .placement
-                            .nest
-                            .resolve(surface.placement.reference.region),
-                        SurfaceNest::Taskbar | SurfaceNest::Desktop
-                    )
-                })
-            });
-            (
-                shell_hosted,
-                std::iter::once(state.hwnd)
-                    .chain(state.mirror_hwnds.iter().copied())
-                    .chain(state.desktop_hwnds.iter().flatten().copied())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        if !shell_hosted {
-            continue;
-        }
-        let invalid = windows
-            .iter()
-            .any(|window| unsafe { !IsWindow(window.to_hwnd()).as_bool() });
-        if invalid && !native_interop::find_taskbars().is_empty() {
-            diagnose::log("watchdog: shell-hosted surface was destroyed -> relaunching");
-            relaunch_self();
+            if !shell_hosted {
+                orphaned_since = None;
+                continue;
+            }
+            let shell_is_back = !native_interop::find_taskbars().is_empty();
+            let invalid = windows
+                .iter()
+                .any(|window| unsafe { !IsWindow(window.to_hwnd()).as_bool() });
+            if invalid {
+                orphaned_since = None;
+                if shell_is_back {
+                    diagnose::log("watchdog: shell-hosted surface was destroyed -> relaunching");
+                    relaunch_self();
+                }
+                continue;
+            }
+
+            // An orphan gets a grace period: explorer's own TaskbarCreated
+            // broadcast re-embeds the widget well inside it, so the normal
+            // recovery path stays in charge wherever it still works.
+            if !windows.iter().copied().any(parent_was_destroyed) {
+                orphaned_since = None;
+                continue;
+            }
+            let since = *orphaned_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(ORPHAN_RECOVERY_SECS) && shell_is_back {
+                diagnose::log(format!(
+                    "watchdog: shell-hosted surface orphaned for {ORPHAN_RECOVERY_SECS}s -> relaunching"
+                ));
+                orphaned_since = None;
+                relaunch_self();
+            }
         }
     });
 }
@@ -1629,6 +1759,7 @@ pub fn run() {
         }
 
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
+        PRIMARY_HWND.store(SendHwnd::from_hwnd(hwnd).0, Ordering::Relaxed);
 
         let is_dark = theme::is_dark_mode();
         {
