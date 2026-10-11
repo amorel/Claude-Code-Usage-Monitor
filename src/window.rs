@@ -1686,7 +1686,30 @@ pub(crate) fn is_startup_enabled() -> bool {
         let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
 
         // Case-insensitive comparison (Windows paths are case-insensitive)
-        reg_value.eq_ignore_ascii_case(&current_exe)
+        startup_command_executable(&reg_value).eq_ignore_ascii_case(&current_exe)
+    }
+}
+
+/// The executable named by a Run-key command line, without quotes or arguments.
+///
+/// Comparing the whole value against the executable path reported a startup
+/// entry carrying `--diagnose` as disabled; re-ticking the option then rewrote
+/// the entry and silently dropped the diagnostic log at the next sign-in.
+fn startup_command_executable(command: &str) -> &str {
+    let command = command.trim();
+    match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => command,
+    }
+}
+
+/// Run-key command line for this executable, keeping diagnostics switched on
+/// across sign-ins when the running instance has them.
+fn startup_command_line(exe: &str, diagnose: bool) -> String {
+    if diagnose {
+        format!("\"{exe}\" --diagnose")
+    } else {
+        exe.to_string()
     }
 }
 
@@ -1712,16 +1735,18 @@ pub(crate) fn set_startup_enabled(enable: bool) {
             let mut exe_buf = [0u16; 260];
             let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
             if len > 0 {
+                let exe = String::from_utf16_lossy(&exe_buf[..len]);
+                let command =
+                    native_interop::wide_str(&startup_command_line(&exe, diagnose::is_enabled()));
                 // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     None,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
-                        byte_len as usize,
+                        command.as_ptr() as *const u8,
+                        command.len() * 2,
                     )),
                 );
             }
@@ -3386,6 +3411,32 @@ mod language_menu_tests {
                 Some(language)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_command_tests {
+    use super::*;
+
+    const EXE: &str =
+        r"C:\Users\Someone\AppData\Local\ClaudeCodeUsageMonitor\claude-code-usage-monitor.exe";
+
+    #[test]
+    fn a_startup_entry_carrying_arguments_still_names_this_executable() {
+        assert_eq!(startup_command_executable(EXE), EXE);
+        assert_eq!(startup_command_executable(&format!("\"{EXE}\"")), EXE);
+        assert_eq!(
+            startup_command_executable(&format!("\"{EXE}\" --diagnose")),
+            EXE
+        );
+    }
+
+    #[test]
+    fn rewriting_the_startup_entry_keeps_diagnostics_that_were_on() {
+        let with_log = startup_command_line(EXE, true);
+        assert!(with_log.ends_with(" --diagnose"));
+        assert_eq!(startup_command_executable(&with_log), EXE);
+        assert_eq!(startup_command_line(EXE, false), EXE);
     }
 }
 
