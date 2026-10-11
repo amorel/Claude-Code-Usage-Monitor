@@ -1850,7 +1850,7 @@ fn current_executable_path() -> Option<String> {
 /// Returns true only if the startup registry value points to this executable.
 pub(crate) fn is_startup_enabled() -> bool {
     match (read_startup_command(), current_executable_path()) {
-        (Some(command), Some(executable)) => startup_command_targets(&command, &executable),
+        (Some(command), Some(executable)) => startup_command_launches(&command, &executable),
         _ => false,
     }
 }
@@ -1862,10 +1862,55 @@ fn upgrade_legacy_startup_command() {
     else {
         return;
     };
-    if command != startup_command(&executable) && startup_command_targets(&command, &executable) {
+    let (target, keeps_log) = split_startup_diagnose(&command);
+    if command != startup_command_line(&executable, keeps_log)
+        && startup_command_targets(target, &executable)
+    {
         set_startup_enabled(true);
         diagnose::log("startup command upgraded to a quoted path");
     }
+}
+
+/// The one argument a startup entry of ours may carry: it keeps the
+/// diagnostic log on across sign-ins.
+const STARTUP_DIAGNOSE_ARGUMENT: &str = "--diagnose";
+
+/// A Run-key command without its trailing `--diagnose`, and whether it had one.
+fn split_startup_diagnose(command: &str) -> (&str, bool) {
+    let command = command.trim();
+    match command.strip_suffix(STARTUP_DIAGNOSE_ARGUMENT) {
+        Some(rest) if rest.ends_with(char::is_whitespace) => (rest.trim_end(), true),
+        _ => (command, false),
+    }
+}
+
+/// Whether a Run-key command launches this executable, with or without
+/// `--diagnose`.
+///
+/// Comparing the bare command reported a startup entry carrying `--diagnose`
+/// as disabled; re-ticking the option then rewrote the entry and silently
+/// dropped the diagnostic log at the next sign-in.
+fn startup_command_launches(command: &str, executable: &str) -> bool {
+    startup_command_targets(split_startup_diagnose(command).0, executable)
+}
+
+/// Run-key command line for this executable, keeping the diagnostic log on
+/// across sign-ins when asked to.
+fn startup_command_line(executable: &str, keeps_log: bool) -> String {
+    let command = startup_command(executable);
+    if keeps_log {
+        format!("{command} {STARTUP_DIAGNOSE_ARGUMENT}")
+    } else {
+        command
+    }
+}
+
+/// Whether the current startup entry is this executable's and keeps the log.
+fn startup_entry_keeps_log(executable: &str) -> bool {
+    read_startup_command().is_some_and(|command| {
+        let (target, keeps_log) = split_startup_diagnose(&command);
+        keeps_log && startup_command_targets(target, executable)
+    })
 }
 
 pub(crate) fn set_startup_enabled(enable: bool) {
@@ -1888,8 +1933,12 @@ pub(crate) fn set_startup_enabled(enable: bool) {
 
         if enable {
             if let Some(executable) = current_executable_path() {
+                // Keep the diagnostic log when the running instance has it or
+                // the entry being rewritten already carried it.
+                let keeps_log = diagnose::is_enabled() || startup_entry_keeps_log(&executable);
                 // Write the wide string including null terminator
-                let command = native_interop::wide_str(&startup_command(&executable));
+                let command =
+                    native_interop::wide_str(&startup_command_line(&executable, keeps_log));
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
@@ -4023,6 +4072,71 @@ mod language_menu_tests {
                 language_from_menu_command_id(language_menu_command_id(language)),
                 Some(language)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_diagnose_command_tests {
+    use super::*;
+
+    const EXE: &str =
+        r"C:\Users\Someone\AppData\Local\ClaudeCodeUsageMonitor\claude-code-usage-monitor.exe";
+
+    #[test]
+    fn a_startup_entry_carrying_diagnose_still_launches_this_executable() {
+        assert!(startup_command_launches(EXE, EXE));
+        assert!(startup_command_launches(&format!("\"{EXE}\""), EXE));
+        assert!(startup_command_launches(
+            &format!("\"{EXE}\" --diagnose"),
+            EXE
+        ));
+        assert!(startup_command_launches(
+            &format!("  \"{EXE}\"   --diagnose  "),
+            EXE
+        ));
+        assert!(startup_command_launches(&format!("{EXE} --diagnose"), EXE));
+    }
+
+    #[test]
+    fn other_arguments_and_installations_are_still_not_ours() {
+        assert!(!startup_command_launches(
+            &format!("\"{EXE}\" --dashboard"),
+            EXE
+        ));
+        assert!(!startup_command_launches(
+            &format!("\"{EXE}\" --diagnose --dashboard"),
+            EXE
+        ));
+        assert!(!startup_command_launches(
+            &format!("\"{EXE}\"--diagnose"),
+            EXE
+        ));
+        assert!(!startup_command_launches(
+            r#""C:\Other\claude-code-usage-monitor.exe" --diagnose"#,
+            EXE
+        ));
+        assert!(!startup_command_launches("--diagnose", EXE));
+    }
+
+    #[test]
+    fn rewriting_the_startup_entry_keeps_diagnostics_that_were_on() {
+        let with_log = startup_command_line(EXE, true);
+        assert_eq!(with_log, format!("\"{EXE}\" --diagnose"));
+        assert!(startup_command_launches(&with_log, EXE));
+        assert_eq!(startup_command_line(EXE, false), startup_command(EXE));
+    }
+
+    #[test]
+    fn the_quoted_path_upgrade_keeps_the_log_and_leaves_a_quoted_entry_alone() {
+        let legacy = format!("{EXE} --diagnose");
+        let (target, keeps_log) = split_startup_diagnose(&legacy);
+        assert_eq!((target, keeps_log), (EXE, true));
+        assert_ne!(legacy, startup_command_line(EXE, keeps_log));
+
+        for current in [startup_command_line(EXE, true), startup_command(EXE)] {
+            let (_, keeps_log) = split_startup_diagnose(&current);
+            assert_eq!(current, startup_command_line(EXE, keeps_log));
         }
     }
 }
