@@ -2466,6 +2466,10 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
+        // This instance owns the single-instance mutex: whatever ended the
+        // previous one, a deliberate menu exit no longer describes the widget.
+        app_settings::clear_user_quit();
+
         let mut settings = load_settings();
         let classic_theme_path = theme_engine::ensure_starter_theme().ok();
         let mut configured_theme_path = settings.active_theme_path.as_deref().map(PathBuf::from);
