@@ -321,6 +321,29 @@ pub fn app_data_directory() -> PathBuf {
     root.join("ClaudeCodeUsageMonitor")
 }
 
+/// Marker left when the user quits from the widget's own menu.
+///
+/// A keep-alive supervisor running outside the app (`~/.claude/scripts/garde-apps`
+/// on Arnaud's machines) relaunches the widget whenever it disappears, and this
+/// is the only way it can tell a deliberate exit from a crash or a kill: a
+/// process that is gone leaves no other trace of why. Cleared at every startup,
+/// so a later crash is never mistaken for an old deliberate exit.
+pub fn user_quit_marker_path() -> PathBuf {
+    app_data_directory().join("user-quit")
+}
+
+pub fn record_user_quit(unix_secs: u64) -> Result<(), String> {
+    let path = user_quit_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(&path, unix_secs.to_string()).map_err(|error| error.to_string())
+}
+
+pub fn clear_user_quit() {
+    let _ = std::fs::remove_file(user_quit_marker_path());
+}
+
 /// Test threads get independent settings, themes, menus, and caches. Do not
 /// change APPDATA: provider discovery and parallel tests also read it.
 #[cfg(test)]
@@ -523,6 +546,21 @@ mod tests {
                 enabled
             );
         }
+    }
+
+    #[test]
+    fn a_menu_exit_leaves_a_marker_until_the_next_startup_clears_it() {
+        clear_user_quit();
+        assert!(!user_quit_marker_path().exists());
+
+        record_user_quit(1_794_310_200).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(user_quit_marker_path()).unwrap(),
+            "1794310200"
+        );
+
+        clear_user_quit();
+        assert!(!user_quit_marker_path().exists());
     }
 
     #[test]

@@ -775,6 +775,13 @@ pub(super) unsafe extern "system" fn wnd_proc(
                 }
                 IDM_VERSION_ACTION => perform_update_action(hwnd),
                 2 => {
+                    // The only exit a keep-alive supervisor must leave alone.
+                    match app_settings::record_user_quit(now_unix_secs()) {
+                        Ok(()) => diagnose::log("quit requested from the menu"),
+                        Err(error) => diagnose::log(format!(
+                            "quit requested from the menu; unable to record it: {error}"
+                        )),
+                    }
                     let _ =
                         PostMessageW(Some(controller_for(hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
