@@ -1,4 +1,8 @@
 use super::*;
+use windows::core::PWSTR;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct DragRelease {
@@ -181,6 +185,10 @@ pub(super) unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_CLOSE | WM_APP_QUIT => {
+            diagnose::log(format!(
+                "close requested on the widget window ({})",
+                describe_close_origin()
+            ));
             let _ = PostMessageW(Some(controller_for(hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
@@ -1025,6 +1033,40 @@ pub(super) unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// What Win32 can tell about who asked for a close: whether the message came
+/// from another thread or process, and which process owned the foreground
+/// window at that moment. The sender itself is never reported by Windows.
+/// Between 09 and 11/11/2026 the widget closed three times leaving no line at
+/// all, no crash report and no kill by a local guard: this is what was missing.
+pub(super) fn describe_close_origin() -> String {
+    unsafe {
+        let origin = if InSendMessageEx(None) & ISMEX_SEND != 0 {
+            "sent by another thread or process"
+        } else {
+            "posted, or from this thread"
+        };
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        let image = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .ok()
+            .and_then(|process| {
+                let mut buffer = [0u16; 1024];
+                let mut length = buffer.len() as u32;
+                let named = QueryFullProcessImageNameW(
+                    process,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(buffer.as_mut_ptr()),
+                    &mut length,
+                )
+                .is_ok();
+                let _ = CloseHandle(process);
+                named.then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("{origin}; foreground window owned by pid {pid}: {image}")
     }
 }
 

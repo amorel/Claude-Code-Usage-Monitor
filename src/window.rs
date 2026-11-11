@@ -2751,6 +2751,10 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        diagnose::log(format!(
+            "message loop ended, process exiting (code {})",
+            msg.wParam.0
+        ));
     }
 }
 
