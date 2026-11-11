@@ -53,9 +53,27 @@ pub(super) unsafe extern "system" fn controller_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_CLOSE | WM_APP_QUIT => {
-            diagnose::log("controller: application shutdown requested");
+            diagnose::log(format!(
+                "controller: application shutdown requested ({})",
+                message_loop::describe_close_origin()
+            ));
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
+        }
+        WM_QUERYENDSESSION => {
+            diagnose::log(format!(
+                "controller: Windows session end queried (flags {:#x})",
+                lparam.0
+            ));
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_ENDSESSION => {
+            diagnose::log(format!(
+                "controller: Windows session ending={} (flags {:#x})",
+                wparam.0 != 0,
+                lparam.0
+            ));
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
             // Withdraw the published target before destroying surfaces, so their
